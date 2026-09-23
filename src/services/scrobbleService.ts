@@ -41,7 +41,7 @@ const PROCESS_INTERVAL_MS = 60_000; // 1 minute
 /*  Exclusion check                                                    */
 /* ------------------------------------------------------------------ */
 
-function isExcluded(song: Child, playlistId?: string): boolean {
+export function isExcluded(song: Child, playlistId?: string): boolean {
   const { excludedAlbums, excludedArtists, excludedPlaylists } =
     scrobbleExclusionStore.getState();
   if (song.albumId && song.albumId in excludedAlbums) return true;

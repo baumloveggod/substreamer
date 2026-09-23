@@ -22,7 +22,7 @@ import { authStore } from '../store/authStore';
 import { offlineModeStore } from '../store/offlineModeStore';
 import { FORMAT_PRESETS, playbackSettingsStore, type StreamFormat, type MaxBitRate } from '../store/playbackSettingsStore';
 import { serverInfoStore, type ServerInfo } from '../store/serverInfoStore';
-import { supports } from './serverCapabilityService';
+import { supports, supportsExtension } from './serverCapabilityService';
 
 const reactNativeCrypto: Crypto = {
   getRandomValues: <T extends ArrayBufferView | null>(array: T): T => {
@@ -1316,5 +1316,127 @@ export async function deleteShare(id: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Playback reporting (OpenSubsonic `playbackReport` extension)       */
+/* ------------------------------------------------------------------ */
+
+/** A playback state the `reportPlayback` extension accepts. */
+export type PlaybackReportState = 'starting' | 'playing' | 'paused' | 'stopped';
+
+/**
+ * Report live playback state to the server. `ignoreScrobble` is always set by
+ * the caller: we submit plays ourselves through `scrobble.view`, and both
+ * Navidrome and Ampache count a play of their own without it.
+ */
+export async function reportPlayback(args: {
+  id: string;
+  state: PlaybackReportState;
+  positionMs: number;
+  playbackRate: number;
+}): Promise<boolean> {
+  const api = getApi();
+  if (!api) return false;
+  try {
+    await api.reportPlayback({
+      mediaId: args.id,
+      mediaType: 'song',
+      positionMs: args.positionMs,
+      state: args.state,
+      playbackRate: args.playbackRate,
+      ignoreScrobble: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Server-side play queue                                             */
+/* ------------------------------------------------------------------ */
+
+/** A play queue as the server holds it. `index` is already resolved to a slot. */
+export interface ServerPlayQueue {
+  entry: Child[];
+  index: number;
+  positionMs: number;
+}
+
+/**
+ * Store the play queue on the server. Uses `savePlayQueueByIndex` where the
+ * `indexBasedQueue` extension is advertised: plain `savePlayQueue` identifies
+ * the current track by id, which resolves to the FIRST match, so a queue holding
+ * the same song twice comes back positioned on the wrong one.
+ */
+export async function savePlayQueue(args: {
+  ids: string[];
+  currentIndex: number;
+  positionMs: number;
+}): Promise<boolean> {
+  const api = getApi();
+  if (!api) return false;
+  if (args.ids.length === 0) return false;
+  const index = Math.min(Math.max(0, args.currentIndex), args.ids.length - 1);
+  try {
+    if (supportsExtension('indexBasedQueue')) {
+      await api.savePlayQueueByIndex({
+        id: args.ids,
+        currentIndex: index,
+        position: args.positionMs,
+      });
+    } else {
+      await api.savePlayQueue({
+        id: args.ids,
+        current: args.ids[index],
+        position: args.positionMs,
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read back the queue stored on the server, or `null` when there is none (or the
+ * server rejected the call). The index-based response carries the slot directly;
+ * the classic one names the current song, which we resolve against the entries.
+ */
+export async function getPlayQueue(): Promise<ServerPlayQueue | null> {
+  const api = getApi();
+  if (!api) return null;
+  try {
+    if (supportsExtension('indexBasedQueue')) {
+      const response = await api.getPlayQueueByIndex();
+      throwIfSubsonicFailure(response, 'getPlayQueueByIndex');
+      const queue = response.playQueueByIndex;
+      const entry = queue?.entry ?? [];
+      if (entry.length === 0) return null;
+      return {
+        entry,
+        index: Math.min(Math.max(0, queue?.currentIndex ?? 0), entry.length - 1),
+        positionMs: queue?.position ?? 0,
+      };
+    }
+
+    const response = await api.getPlayQueue();
+    throwIfSubsonicFailure(response, 'getPlayQueue');
+    const queue = response.playQueue;
+    const entry = queue?.entry ?? [];
+    if (entry.length === 0) return null;
+    // `current` is a song id on every server we have source for, but the SDK
+    // types it as `number | string` — a numeric one can only be an id too.
+    const currentId = queue?.current != null ? String(queue.current) : null;
+    const found = currentId != null ? entry.findIndex((c) => c.id === currentId) : -1;
+    return {
+      entry,
+      index: found === -1 ? 0 : found,
+      positionMs: queue?.position ?? 0,
+    };
+  } catch {
+    return null;
   }
 }

@@ -1098,7 +1098,7 @@ if (!base.endsWith("/rest/")) base += "rest/";
 	}
 
 	// id is optional on OpenSubsonic compatible servers
-	async savePlayQueue(args: { id?: string; current?: string; position: number }) {
+	async savePlayQueue(args: { id?: string | string[]; current?: string; position: number }) {
 		return this.#requestJSON<SubsonicBaseResponse>("savePlayQueue", args);
 	}
 

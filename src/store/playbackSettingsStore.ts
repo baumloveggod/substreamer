@@ -133,6 +133,14 @@ export type ReplayGainModeSetting = (typeof REPLAY_GAIN_MODES)[number];
  */
 export const LOOKAHEAD_MAX_CACHE_MB = 512;
 
+/**
+ * How many track changes may pass before the play queue is mirrored to the
+ * server. 1 = every track. Saving is a request per change, so the default sits
+ * a few tracks apart; backgrounding the app flushes regardless.
+ */
+export const QUEUE_SYNC_INTERVALS = [1, 3, 5, 10] as const;
+export type QueueSyncInterval = (typeof QUEUE_SYNC_INTERVALS)[number];
+
 export interface PlaybackSettingsState {
   /** Maximum bitrate for streaming. null = no limit (server default). */
   maxBitRate: MaxBitRate;
@@ -182,6 +190,13 @@ export interface PlaybackSettingsState {
   /** ReplayGain loudness normalisation: off / track / album. */
   replayGainMode: ReplayGainModeSetting;
 
+  /** Whether live play/pause state is reported to the server (`playbackReport`). */
+  reportPlaybackEnabled: boolean;
+  /** Whether the play queue is mirrored to the server for other clients. */
+  queueSyncEnabled: boolean;
+  /** Track changes between automatic queue saves. */
+  queueSyncInterval: QueueSyncInterval;
+
   setMaxBitRate: (bitRate: MaxBitRate) => void;
   setStreamFormat: (format: StreamFormat) => void;
   setEstimateContentLength: (enabled: boolean) => void;
@@ -202,6 +217,9 @@ export interface PlaybackSettingsState {
   setPlaybackMode: (mode: PlaybackModeSetting) => void;
   setCrossfadeDurationMs: (ms: CrossfadeDurationMs) => void;
   setReplayGainMode: (mode: ReplayGainModeSetting) => void;
+  setReportPlaybackEnabled: (enabled: boolean) => void;
+  setQueueSyncEnabled: (enabled: boolean) => void;
+  setQueueSyncInterval: (interval: QueueSyncInterval) => void;
 }
 
 const PERSIST_KEY = 'substreamer-playback-settings';
@@ -247,6 +265,9 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
       playbackMode: 'gapless',
       crossfadeDurationMs: 5000,
       replayGainMode: 'off',
+      reportPlaybackEnabled: false,
+      queueSyncEnabled: false,
+      queueSyncInterval: 3,
 
       setMaxBitRate: (maxBitRate) => set({ maxBitRate }),
       setStreamFormat: (streamFormat) => set({ streamFormat: normalizeFormat(streamFormat) }),
@@ -268,6 +289,9 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
       setPlaybackMode: (playbackMode) => set({ playbackMode }),
       setCrossfadeDurationMs: (crossfadeDurationMs) => set({ crossfadeDurationMs }),
       setReplayGainMode: (replayGainMode) => set({ replayGainMode }),
+      setReportPlaybackEnabled: (reportPlaybackEnabled) => set({ reportPlaybackEnabled }),
+      setQueueSyncEnabled: (queueSyncEnabled) => set({ queueSyncEnabled }),
+      setQueueSyncInterval: (queueSyncInterval) => set({ queueSyncInterval }),
     }),
     {
       name: PERSIST_KEY,
@@ -295,6 +319,9 @@ export const playbackSettingsStore = create<PlaybackSettingsState>()(
         playbackMode: state.playbackMode,
         crossfadeDurationMs: state.crossfadeDurationMs,
         replayGainMode: state.replayGainMode,
+        reportPlaybackEnabled: state.reportPlaybackEnabled,
+        queueSyncEnabled: state.queueSyncEnabled,
+        queueSyncInterval: state.queueSyncInterval,
       }),
     }
   )

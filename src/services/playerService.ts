@@ -28,6 +28,15 @@ import { equalizerSettingsStore, EQ_CUSTOM_PRESET_LABEL } from '../store/equaliz
 import { sleepTimerStore } from '../store/sleepTimerStore';
 import { shuffleArray } from '../utils/arrayHelpers';
 import { addCompletedScrobble, sendNowPlaying } from './scrobbleService';
+import {
+  reportPlaybackPosition,
+  reportPlaybackState,
+  reportTrackChange,
+} from './playbackReportService';
+import {
+  flushQueueToServer,
+  onTrackChangedForQueueSync,
+} from './playQueueSyncService';
 import { registerPlayerPlayStatListener } from './playStatsService';
 import { syncProxyUpstreams } from './sslTrustService';
 import { getLocalTrackUri, waitForTrackMapsReady } from './musicCacheService';
@@ -98,6 +107,11 @@ let activeScrobbleIndex: number | null = null;
 let activeScrobbleDone = false;
 let lastMilestoneValue = 0;
 
+/** The playlist a track is playing from, when it came from one — drives exclusions. */
+function playlistIdFor(child: Child | null): string | undefined {
+  return child ? trackPlaylistMap.get(child.id) : undefined;
+}
+
 /** Report a completed play once per playthrough, guarded by `activeScrobbleDone`. */
 function reportPlay(trackIndex: number): void {
   if (activeScrobbleDone) return;
@@ -146,13 +160,25 @@ export async function initPlayer(): Promise<void> {
   // natively across restarts, so re-apply the persisted choice.
   await applyReplayGain();
 
-  // --- Playback state → store ---
+  // --- Playback state → store + live playback report ---
   tp.onStateChange((state) => {
     const store = playerStore.getState();
-    store.setPlaybackState(mapState(state));
+    const previous = store.playbackState;
+    const next = mapState(state);
+    store.setPlaybackState(next);
     if (state === 'playing') {
       if (store.error) store.setError(null);
       if (store.retrying) store.setRetrying(false);
+    }
+    // Only a genuine play↔pause flip is worth a report; buffering and loading
+    // pass through both on their way to 'playing'.
+    const wasPlaying = previous === 'playing';
+    const isPlaying = next === 'playing';
+    const isPaused = next === 'paused';
+    if (isPaused && wasPlaying) {
+      void reportPlaybackState('paused', store.currentTrack, store.position, playlistIdFor(store.currentTrack));
+    } else if (isPlaying && previous === 'paused') {
+      void reportPlaybackState('playing', store.currentTrack, store.position, playlistIdFor(store.currentTrack));
     }
   });
 
@@ -178,12 +204,23 @@ export async function initPlayer(): Promise<void> {
     if (reason === 'auto-advance' && activeScrobbleIndex != null) {
       reportPlay(activeScrobbleIndex);
     }
+    // Hand the server's now-playing over from the outgoing track to the incoming
+    // one. Read before the store moves on, so the outgoing track is still current.
+    const { currentTrack: outgoing, position: outgoingPosition } = playerStore.getState();
+    const child = track?.id ? (currentChildQueue.find((c) => c.id === track.id) ?? null) : null;
+    void reportTrackChange(
+      outgoing,
+      outgoingPosition,
+      child,
+      playlistIdFor(outgoing),
+      playlistIdFor(child),
+    );
     if (track?.id) {
-      const child = currentChildQueue.find((c) => c.id === track.id) ?? null;
       playerStore.getState().setCurrentTrack(child, index ?? null);
       if (child) sendNowPlaying(child, trackPlaylistMap.get(child.id));
       // The queue is unchanged here — only the cursor moved, so this is one UPDATE.
       if (index != null && index >= 0) persistCurrentIndex(index);
+      onTrackChangedForQueueSync();
     } else {
       playerStore.getState().setCurrentTrack(null, null);
     }
@@ -229,6 +266,12 @@ export async function initPlayer(): Promise<void> {
   tp.onQueueEnd(() => {
     if (activeScrobbleIndex != null) reportPlay(activeScrobbleIndex);
     const currentTrack = playerStore.getState().currentTrack;
+    void reportPlaybackState(
+      'stopped',
+      currentTrack,
+      playerStore.getState().position,
+      playlistIdFor(currentTrack),
+    );
     const endDuration = currentTrack?.duration ?? 0;
     if (endDuration > 0) {
       playerStore.getState().setProgress(endDuration, endDuration, endDuration);
@@ -289,6 +332,9 @@ export async function initPlayer(): Promise<void> {
       if (currentTrack?.id && position > 0) {
         flushPosition(position, currentTrack.id, currentTrack.duration);
       }
+      // Leaving the app is the moment the user is most likely to pick up another
+      // device, so mirror the queue now rather than waiting out the interval.
+      flushQueueToServer();
     }
   });
 }
@@ -541,6 +587,67 @@ export async function playTrack(
   }
 }
 
+/**
+ * Replace the local queue with one restored from the server and park on its
+ * saved track and position WITHOUT playing — the user asked to pick the queue
+ * up, not to start sound. Mirrors `playTrack`'s preparation (local URIs,
+ * cover-art auth, the iOS SSL proxy) so downloaded tracks resolve to files.
+ *
+ * Returns false when nothing in the restored queue is playable here.
+ */
+export async function restoreServerQueue(
+  queue: Child[],
+  index: number,
+  positionSec: number,
+): Promise<boolean> {
+  await awaitHydration();
+  pendingResumePosition = null;
+  playerStore.getState().setQueueLoading(true);
+
+  try {
+    await waitForTrackMapsReady();
+    await ensureCoverArtAuth();
+    if (Platform.OS === 'ios') {
+      await syncProxyUpstreams();
+    }
+
+    const target = queue[Math.min(Math.max(0, index), queue.length - 1)] ?? null;
+    const { rnTracks, filteredQueue } = await buildPlayableQueue(queue);
+    if (rnTracks.length === 0) {
+      playbackToastStore.getState().fail();
+      return false;
+    }
+
+    currentChildQueue = filteredQueue;
+    // The server queue carries no playlist provenance, so no track in it is
+    // attributable to a playlist for exclusion purposes.
+    trackPlaylistMap.clear();
+    playerStore.getState().setQueue(filteredQueue);
+
+    const formats: Record<string, EffectiveFormat> = {};
+    for (const child of filteredQueue) formats[child.id] = stampQueueFormat(child);
+    playerStore.getState().setQueueFormats(formats);
+
+    // Translate the saved cursor onto the filtered queue; the position belongs to
+    // that track, so it only survives if the track did.
+    let startIndex = target ? filteredQueue.findIndex((c) => c.id === target.id) : 0;
+    const keptTarget = startIndex !== -1;
+    if (!keptTarget) startIndex = 0;
+
+    await tp.setQueue(rnTracks, startIndex);
+    if (keptTarget && positionSec > 0) {
+      await tp.seekTo(positionSec);
+    }
+    persistQueue(filteredQueue, startIndex);
+    return true;
+  } catch {
+    playbackToastStore.getState().fail();
+    return false;
+  } finally {
+    playerStore.getState().setQueueLoading(false);
+  }
+}
+
 /** Toggle between play and pause. */
 export async function togglePlayPause(): Promise<void> {
   await awaitHydration();
@@ -583,6 +690,12 @@ export async function seekTo(position: number): Promise<void> {
   await tp.seekTo(target);
   const store = playerStore.getState();
   store.setProgress(target, store.duration, store.bufferedPosition);
+  reportPlaybackPosition(
+    store.playbackState === 'paused' ? 'paused' : 'playing',
+    store.currentTrack,
+    target,
+    playlistIdFor(store.currentTrack),
+  );
 }
 
 /** Skip to a specific track in the queue by index. */
@@ -737,6 +850,15 @@ export function clearSleepTimer(): void {
 
 /** Internal clear-state helper (does not await hydration — hydrate calls it). */
 async function clearPlayerStateInternal(): Promise<void> {
+  // Nothing is playing after this, so end the server's session rather than
+  // leaving it to time out.
+  const cleared = playerStore.getState();
+  void reportPlaybackState(
+    'stopped',
+    cleared.currentTrack,
+    cleared.position,
+    playlistIdFor(cleared.currentTrack),
+  );
   pendingResumePosition = null;
   currentChildQueue = [];
   trackPlaylistMap.clear();

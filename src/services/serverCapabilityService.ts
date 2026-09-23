@@ -8,6 +8,14 @@ type ServerCapability =
 	| 'internetRadioCrud'
 	| 'structuredLyrics';
 
+/**
+ * Capabilities the server advertises itself via `getOpenSubsonicExtensions`.
+ * Kept apart from {@link ServerCapability}: those are inferred from the server
+ * type / API level, these are read from what the server actually claims, which
+ * is the only reliable signal for an extension.
+ */
+type ServerExtension = 'playbackReport' | 'indexBasedQueue';
+
 // Known OpenSubsonic servers — keyed by lowercase `type` from ping response
 const KNOWN_SERVERS: Record<string, ReadonlySet<ServerCapability>> = {
 	navidrome: new Set(['shares', 'scan', 'fullScan', 'albumArtistRating', 'internetRadioCrud', 'structuredLyrics']),
@@ -77,4 +85,16 @@ export function isAdminRoleUnknown(): boolean {
 	return supports('scan') && serverInfoStore.getState().adminRole === null;
 }
 
-export type { ServerCapability };
+/**
+ * True when the server advertises the named OpenSubsonic extension. The list is
+ * fetched once by `fetchServerInfo` and persisted, so this costs no request.
+ *
+ * Of the servers we have source for: Navidrome and Ampache advertise
+ * `playbackReport`; Navidrome, Ampache and Nextcloud Music advertise
+ * `indexBasedQueue`; gonic advertises neither.
+ */
+export function supportsExtension(extension: ServerExtension): boolean {
+	return serverInfoStore.getState().extensions.some((e) => e.name === extension);
+}
+
+export type { ServerCapability, ServerExtension };

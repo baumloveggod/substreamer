@@ -76,3 +76,6 @@ export const getShares = jest.fn().mockResolvedValue({ ok: false, reason: 'error
 export const createShare = jest.fn().mockResolvedValue(null);
 export const updateShare = jest.fn().mockResolvedValue(undefined);
 export const deleteShare = jest.fn().mockResolvedValue(false);
+export const reportPlayback = jest.fn().mockResolvedValue(true);
+export const savePlayQueue = jest.fn().mockResolvedValue(true);
+export const getPlayQueue = jest.fn().mockResolvedValue(null);

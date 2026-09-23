@@ -11,6 +11,8 @@ import { DownloadingCard } from '../components/settings/DownloadingCard';
 import { EqualizerCard } from '../components/settings/EqualizerCard';
 import { LookaheadCacheCard } from '../components/settings/LookaheadCacheCard';
 import { PlaybackModeCard } from '../components/settings/PlaybackModeCard';
+import { PlaybackReportCard } from '../components/settings/PlaybackReportCard';
+import { PlayQueueSyncCard } from '../components/settings/PlayQueueSyncCard';
 import { PlayerControlsCard } from '../components/settings/PlayerControlsCard';
 import { RemoteControlsCard } from '../components/settings/RemoteControlsCard';
 import { ReplayGainCard } from '../components/settings/ReplayGainCard';
@@ -47,6 +49,9 @@ export function SettingsPlaybackScreen() {
   const playbackMode = playbackSettingsStore((s) => s.playbackMode);
   const crossfadeDurationMs = playbackSettingsStore((s) => s.crossfadeDurationMs);
   const replayGainMode = playbackSettingsStore((s) => s.replayGainMode);
+  const reportPlaybackEnabled = playbackSettingsStore((s) => s.reportPlaybackEnabled);
+  const queueSyncEnabled = playbackSettingsStore((s) => s.queueSyncEnabled);
+  const queueSyncInterval = playbackSettingsStore((s) => s.queueSyncInterval);
 
   const isDefault =
     maxBitRate === null &&
@@ -63,7 +68,10 @@ export function SettingsPlaybackScreen() {
     lookaheadCount === 3 &&
     playbackMode === 'gapless' &&
     crossfadeDurationMs === 5000 &&
-    replayGainMode === 'off';
+    replayGainMode === 'off' &&
+    !reportPlaybackEnabled &&
+    !queueSyncEnabled &&
+    queueSyncInterval === 3;
 
   const handleResetDefaults = useCallback(() => {
     confirm({
@@ -88,6 +96,9 @@ export function SettingsPlaybackScreen() {
         s.setPlaybackMode('gapless');
         s.setCrossfadeDurationMs(5000);
         s.setReplayGainMode('off');
+        s.setReportPlaybackEnabled(false);
+        s.setQueueSyncEnabled(false);
+        s.setQueueSyncInterval(3);
         updateRemoteCapabilities();
         void applyLookaheadCacheConfig();
         void applyPlaybackMode();
@@ -113,6 +124,8 @@ export function SettingsPlaybackScreen() {
           <PlayerControlsCard />
           <SkipIntervalsCard />
           <RemoteControlsCard />
+          <PlayQueueSyncCard />
+          <PlaybackReportCard />
           {/* Battery-optimization exemption — affects background playback, so it
               lives here under Sound & Playback (Android-only; renders null on iOS). */}
           <BackgroundPlaybackCard />
