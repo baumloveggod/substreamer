@@ -32,6 +32,7 @@ import { ThemedAlertHost } from '../components/ThemedAlertHost';
 import { DARK_MIX, GRADIENT_LOCATIONS, GRADIENT_MIX_CURVE, GradientBackground, LIGHT_MIX } from '../components/GradientBackground';
 import { mixHexColors } from '../utils/colors';
 import { runWhenIdle } from '../utils/runWhenIdle';
+import { markBoot } from '../utils/bootTiming';
 import AnimatedSplashScreen from '../components/AnimatedSplashScreen';
 import { CertificatePromptModal } from '../components/CertificatePromptModal';
 import { CreateShareSheet } from '../components/CreateShareSheet';
@@ -85,13 +86,15 @@ import { runAutoBackupIfNeeded } from '../services/backupService';
 import { startAutoOffline, stopAutoOffline } from '../services/autoOfflineService';
 import { excludeFromBackup } from 'expo-backup-exclusions';
 import { moveToBack } from 'expo-move-to-back';
+import { getDb } from '../store/persistence/db';
 import { flushAllPersistStorages } from '../store/persistence';
-import { awaitKvHydration, rehydrateAllStores } from '../store/persistence/rehydrate';
+import { ensureBootHydration } from '../services/bootSequence';
 import { albumListsStore } from '../store/albumListsStore';
 import { musicCacheStore } from '../store/musicCacheStore';
 import { authStore } from '../store/authStore';
 import { autoOfflineStore } from '../store/autoOfflineStore';
 import { certPromptStore } from '../store/certPromptStore';
+import { completedScrobbleStore } from '../store/completedScrobbleStore';
 import { initializeOfflineFilterBarSync, offlineModeStore } from '../store/offlineModeStore';
 import { playerStore } from '../store/playerStore';
 // Synchronous adapter: the pre-render native-color-scheme read needs a
@@ -198,6 +201,13 @@ const originalHandler = (globalThis as any).ErrorUtils?.getGlobalHandler?.();
   originalHandler?.(error, isFatal);
 });
 
+// The root layout's import graph is fully evaluated by here — the marker separates
+// bundle/module cost from everything React does afterwards.
+markBoot('layoutModule');
+
+/** Guards the one-shot first-render marker below against re-renders. */
+let firstRenderMarked = false;
+
 // Runs the post-login deferred startup chain. Each stage gets its own try/catch, so one
 // non-critical failure (image cache disk error, backup permission denied) cannot suppress
 // unrelated stages like storage checks, backup or sync recovery. Cancellation is checked
@@ -238,6 +248,12 @@ async function runDeferredStartup(getCancelled: () => boolean): Promise<void> {
   idleStage('hydrateDownloadedAlbumCoverArt', () => hydrateDownloadedAlbumCoverArt());
   if (getCancelled()) return;
 
+  // Listening analytics: seven aggregate queries over `scrobble_events`, most of them
+  // full scans. Feeds the home stat tiles and My Listening, which animate on change —
+  // so it arrives here rather than gating boot.
+  idleStage('completedScrobble', () => completedScrobbleStore.getState().hydrateFromDbAsync());
+  if (getCancelled()) return;
+
   // Settings-only "used space" total from a full recursive cache-dir walk — defer to
   // idle; the store already shows the SQL-derived aggregate.
   idleStage('musicCacheStats', async () => {
@@ -246,6 +262,14 @@ async function runDeferredStartup(getCancelled: () => boolean): Promise<void> {
   if (getCancelled()) return;
 
   await stage('checkStorageLimit', () => { checkStorageLimit(); });
+  if (getCancelled()) return;
+
+  // Shrink the WAL file on disk. Boot only folds it (PASSIVE, see db/client.ts);
+  // TRUNCATE blocks until every reader is done, so it runs here and on the pool
+  // thread (getAllAsync, not execSync) rather than on the JS thread at open time.
+  idleStage('walTruncate', async () => {
+    await getDb()?.getAllAsync('PRAGMA wal_checkpoint(TRUNCATE);');
+  });
   if (getCancelled()) return;
 
   // Auto-backup serializes the full scrobble history + writes files — pure,
@@ -316,6 +340,10 @@ async function runDeferredStartup(getCancelled: () => boolean): Promise<void> {
 const FOREGROUND_REFRESH_THRESHOLD_MS = 10 * 60_000;
 
 export default function RootLayout() {
+  if (!firstRenderMarked) {
+    firstRenderMarked = true;
+    markBoot('firstRender');
+  }
   const [splashVisible, setSplashVisible] = useState(true);
   const rehydrated = authStore((s) => s.rehydrated);
   const isLoggedIn = authStore((s) => s.isLoggedIn);
@@ -506,19 +534,15 @@ export default function RootLayout() {
       }
     });
 
-    // Hydrate per-row SQLite-backed stores BEFORE any data-sync flow reads them, THEN run
-    // the startup chain. `rehydrateAllStores` is async (background-thread SQLite IO +
-    // chunked JSON.parse) and is AWAITED to hold that ordering invariant: hydration must
+    // Migrations, then per-row SQLite-backed store hydration, then the startup-critical
+    // async-persisted kvStorage stores — all of it BEFORE any data-sync flow reads them.
+    // `ensureBootHydration` is AWAITED to hold that ordering invariant: hydration must
     // complete before `onStartup()` fires its deferred full album-detail walk, which
     // checks `albumDetailStore.albums` 1500 ms later. Get the order wrong and every
     // launch shows a "full library resync" banner with `missing = library.length`.
+    // The same memoised chain gates the splash, so it runs once, not once per caller.
     void (async () => {
-      await rehydrateAllStores();
-      // Also wait for the startup-critical async-persisted kvStorage stores (offlineMode,
-      // the library lists). They hydrate a microtask after store creation; reading them
-      // any earlier makes the resync comparison and the offline/auto-offline branches
-      // below act on empty defaults.
-      await awaitKvHydration();
+      await ensureBootHydration();
       if (cancelled) return;
       // Set up the native player eagerly so playback is available immediately. The
       // persisted-queue RESTORE is deferred to after the splash (see the

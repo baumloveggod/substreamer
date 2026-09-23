@@ -1,9 +1,12 @@
+import type { InternalDb } from '../client';
 import { getDb } from '../../store/persistence/db';
 import {
   KEPT_TABLES,
   MODEL_TABLES,
   ddlTableNames,
   ensureNormalizedSchema,
+  ensureNormalizedSchemaIfChanged,
+  normalizedSchemaNeedsUpdate,
   normalizedTableNames,
 } from '../createNormalizedTables';
 
@@ -126,5 +129,82 @@ describe('drop scope', () => {
 
   it('reports the library model as droppable', () => {
     expect(normalizedTableNames()).toEqual(expect.arrayContaining(['albums', 'songs']));
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Schema fingerprint gate (PRAGMA user_version)                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Counting fake over the real handle: the gate's whole purpose is to stop issuing
+ * DDL, so the assertion has to be on the number of statements, not on the result.
+ */
+function countingDb(real: InternalDb): { db: InternalDb; execs: string[] } {
+  const execs: string[] = [];
+  const db: InternalDb = {
+    ...real,
+    execSync: (sql: string) => {
+      execs.push(sql);
+      return real.execSync(sql);
+    },
+    getFirstSync: <T,>(sql: string, params?: readonly unknown[]) =>
+      real.getFirstSync<T>(sql, params),
+    getAllSync: <T,>(sql: string, params?: readonly unknown[]) => real.getAllSync<T>(sql, params),
+    withTransactionSync: (fn: () => void) => real.withTransactionSync(fn),
+  };
+  return { db, execs };
+}
+
+describe('ensureNormalizedSchemaIfChanged', () => {
+  beforeEach(() => {
+    // Every test starts from an unstamped DB, as a pre-fingerprint install would.
+    getDb()!.execSync('PRAGMA user_version = 0');
+  });
+
+  it('applies the DDL and stamps the fingerprint when unstamped', () => {
+    const { db, execs } = countingDb(getDb()!);
+
+    expect(ensureNormalizedSchemaIfChanged(db)).toBe(true);
+
+    expect(execs.some((s) => /^CREATE TABLE/i.test(s))).toBe(true);
+    expect(execs.some((s) => /^PRAGMA user_version = \d+$/.test(s))).toBe(true);
+    const stamped = getDb()!.getFirstSync<{ user_version: number }>('PRAGMA user_version');
+    expect(stamped?.user_version).toBeGreaterThan(0);
+  });
+
+  it('issues no DDL at all on the second run', () => {
+    ensureNormalizedSchemaIfChanged(getDb()!);
+
+    const { db, execs } = countingDb(getDb()!);
+    expect(ensureNormalizedSchemaIfChanged(db)).toBe(false);
+
+    expect(execs).toHaveLength(0);
+  });
+
+  it('re-applies when the stored fingerprint does not match the DDL', () => {
+    ensureNormalizedSchemaIfChanged(getDb()!);
+    // Simulate a shipped schema change: the stamp no longer matches the DDL.
+    getDb()!.execSync('PRAGMA user_version = 12345');
+
+    const { db, execs } = countingDb(getDb()!);
+    expect(ensureNormalizedSchemaIfChanged(db)).toBe(true);
+
+    expect(execs.some((s) => /^CREATE TABLE/i.test(s))).toBe(true);
+  });
+
+  it('reports the schema as needing an update only while the stamp differs', () => {
+    expect(normalizedSchemaNeedsUpdate(getDb()!)).toBe(true);
+    ensureNormalizedSchemaIfChanged(getDb()!);
+    expect(normalizedSchemaNeedsUpdate(getDb()!)).toBe(false);
+  });
+
+  it('leaves the unguarded entry point unconditional, so a reset still rebuilds', () => {
+    ensureNormalizedSchemaIfChanged(getDb()!);
+
+    const { db, execs } = countingDb(getDb()!);
+    ensureNormalizedSchema(db); // what resetNormalizedSchema calls
+
+    expect(execs.some((s) => /^CREATE TABLE/i.test(s))).toBe(true);
   });
 });

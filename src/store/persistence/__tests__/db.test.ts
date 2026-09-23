@@ -55,19 +55,34 @@ describe('persistence/db (happy path)', () => {
     expect(mockExecuteSync).toHaveBeenCalledWith('SELECT 42;');
   });
 
+  // PASSIVE, not TRUNCATE: TRUNCATE waits for every reader and rewrites the WAL file,
+  // which is the single most expensive thing boot did on the JS thread. PASSIVE folds
+  // the same pages here (one connection, no readers yet); the file shrink runs from an
+  // idle window in `runDeferredStartup`.
   it('applies PRAGMAs in the documented order (incl. the boot WAL fold)', () => {
     const pragmaSets = mockExecuteSync.mock.calls
       .map((c) => c[0] as string)
-      .filter((sql) => sql.startsWith('PRAGMA') && (sql.includes('=') || sql.includes('wal_checkpoint')));
+      .filter((sql) => sql.startsWith('PRAGMA') && (sql.includes('=') || sql.includes('wal_checkpoint')))
+      // The schema fingerprint stamp is asserted on its own below — it belongs to
+      // the DDL pass, not to the connection setup, and its value moves with schema.ts.
+      .filter((sql) => !sql.startsWith('PRAGMA user_version'));
     expect(pragmaSets).toEqual([
       'PRAGMA journal_mode = WAL;',
-      'PRAGMA wal_checkpoint(TRUNCATE);',
+      'PRAGMA wal_checkpoint(PASSIVE);',
       'PRAGMA synchronous = NORMAL;',
       'PRAGMA foreign_keys = ON;',
       'PRAGMA busy_timeout = 5000;',
       'PRAGMA cache_size = -32000;',
       'PRAGMA temp_store = MEMORY;',
     ]);
+  });
+
+  it('stamps the schema fingerprint so the next boot can skip the DDL pass', () => {
+    const stamps = mockExecuteSync.mock.calls
+      .map((c) => c[0] as string)
+      .filter((sql) => sql.startsWith('PRAGMA user_version ='));
+    expect(stamps).toHaveLength(1);
+    expect(stamps[0]).toMatch(/^PRAGMA user_version = \d+$/);
   });
 
   it('hand-writes no CREATE TABLE at boot', () => {

@@ -15,6 +15,7 @@ import {
 import { getDb } from './persistence/db';
 import { awaitDbWritesIdle } from '../db/client';
 import { resetNormalizedSchema } from '../db/createNormalizedTables';
+import { resetBootHydration } from '../services/bootSequence';
 import { clearPendingScrobbles } from './persistence/pendingScrobbleTable';
 import { clearScrobbles } from './persistence/scrobbleTable';
 import { clearMusicCacheTables } from './musicCacheStore';
@@ -148,6 +149,10 @@ async function clearLegacyBlobTables(): Promise<void> {
 export async function resetAllStores(): Promise<void> {
   // (Native SSL trust + proxy teardown happens in the logout handler, awaited
   // before this runs — see AccountCard.handleLogout.)
+
+  // Drop the memoised boot chain so the next login hydrates from the new
+  // account's data instead of resolving instantly against the old one's.
+  resetBootHydration();
 
   // Unregister cache-service AppState listeners before clearing state so a
   // background→foreground transition while logged out can't fire stalled-

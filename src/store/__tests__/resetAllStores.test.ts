@@ -29,6 +29,18 @@ jest.mock('../../services/imageCacheService', () => ({
   prefetchCoverArt: jest.fn(),
   teardownImageCache: jest.fn(),
   clearImageCache: jest.fn().mockResolvedValue(0),
+  // Pulled in transitively since resetAllStores reached bootSequence → rehydrate →
+  // imageDownloadQueueStore, which subscribes at module scope.
+  subscribeImageQueueChanges: jest.fn(() => () => {}),
+  getImageQueueState: jest.fn(async () => ({
+    cycleId: null,
+    cycleScope: null,
+    cycleTotal: 0,
+    processed: 0,
+    failed: 0,
+    isPaused: false,
+    phase: 'active',
+  })),
 }));
 jest.mock('../../services/musicCacheService', () => ({
   teardownMusicCache: jest.fn(),

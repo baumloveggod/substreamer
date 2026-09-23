@@ -2,7 +2,6 @@ import { errMessage } from '../../utils/errorMessage';
 import { albumListsStore, hydrateAlbumListsFromDb } from '../albumListsStore';
 import { autoOfflineStore } from '../autoOfflineStore';
 import { bookmarksStore } from '../bookmarksStore';
-import { completedScrobbleStore } from '../completedScrobbleStore';
 import { favoritesStore } from '../favoritesStore';
 import { genreStore } from '../genreStore';
 import { imageCacheStore } from '../imageCacheStore';
@@ -64,7 +63,13 @@ export async function rehydrateAllStores(): Promise<RehydrationResult> {
     // persisted one, so its `hydrateFromDbAsync` waits on `persist.hasHydrated()`
     // itself before it replaces anything (see the store).
     ['bookmarks', () => bookmarksStore.getState().hydrateFromDbAsync()],
-    ['completedScrobble', () => completedScrobbleStore.getState().hydrateFromDbAsync()],
+    // completedScrobble is absent by design: its `hydrateFromDbAsync` runs seven
+    // aggregate queries over `scrobble_events`, five of them full scans (only `time`
+    // and `hour` are indexed) plus one that sorts the whole table twice for its window
+    // functions. It feeds the home stat tiles and My Listening, neither of which is
+    // first-paint critical, so boot must not wait on it — `runDeferredStartup`
+    // hydrates it in an idle window instead.
+
     ['favorites', () => favoritesStore.getState().hydrateFromDbAsync()],
     // All four are `persist`-wrapped over the slice they DB-hydrate, like bookmarks
     // above, so each waits on its own `persist.hasHydrated()` before replacing anything.

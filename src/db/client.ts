@@ -21,6 +21,8 @@ import {
 } from '@op-engineering/op-sqlite';
 import { Directory, Paths } from 'expo-file-system';
 
+import { markBoot } from '@/utils/bootTiming';
+
 /** Row-modification counts for a write, mapped from op-SQLite's
  *  `rowsAffected` / `insertId` by {@link adapt}. */
 export interface RunResult {
@@ -249,17 +251,22 @@ export function openDbConnection(): DbConnection {
   ensureDbDir();
   const location = resolveDbLocation();
   const raw = open({ name: DB_NAME, location });
+  markBoot('dbOpen');
 
   raw.executeSync('PRAGMA journal_mode = WAL;');
   // Fold any leftover WAL at boot so the first (boot-critical, synchronous) reads
-  // aren't stuck rebuilding/traversing a large WAL — e.g. after a big write that
-  // didn't checkpoint before an unclean close (a crash/SIGKILL). Best-effort;
-  // normally a fast no-op since the WAL auto-checkpoints during use.
+  // aren't stuck traversing a large WAL — e.g. after a big write that didn't
+  // checkpoint before an unclean close (a crash/SIGKILL). PASSIVE, not TRUNCATE:
+  // this is the only connection and there are no readers yet, so it folds the same
+  // pages, but it never blocks waiting for one. Shrinking the file on disk is the
+  // only thing TRUNCATE adds, and that runs from an idle window after startup
+  // (`runDeferredStartup`). Best-effort; normally a fast no-op.
   try {
-    raw.executeSync('PRAGMA wal_checkpoint(TRUNCATE);');
+    raw.executeSync('PRAGMA wal_checkpoint(PASSIVE);');
   } catch {
     /* best-effort */
   }
+  markBoot('walCheckpoint');
   raw.executeSync('PRAGMA synchronous = NORMAL;');
   raw.executeSync('PRAGMA foreign_keys = ON;');
   raw.executeSync('PRAGMA busy_timeout = 5000;');
@@ -283,5 +290,6 @@ export function openDbConnection(): DbConnection {
     console.warn('[db] readback failed', e);
   }
 
+  markBoot('dbPragmas');
   return { raw, db: adapt(raw), location };
 }

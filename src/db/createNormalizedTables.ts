@@ -60,41 +60,97 @@ const existingColumns = (db: InternalDb, table: string): Set<string> =>
     db.getAllSync<{ name: string }>(`PRAGMA table_info("${table}")`).map((r) => r.name),
   );
 
+/** The DDL applied, without its own transaction — the callers below own that. */
+function applyNormalizedDdl(db: InternalDb): void {
+  // 1. Create any missing tables (fresh install → full schema; existing → no-op).
+  for (const stmt of NORMALIZED_DDL) {
+    if (isCreateTable(stmt)) db.execSync(stmt);
+  }
+  // 2. Add any column schema.ts declares that a pre-existing table lacks — the
+  //    non-destructive path that lets a new column land on populated tables.
+  for (const stmt of NORMALIZED_DDL) {
+    if (!isCreateTable(stmt)) continue;
+    const parsed = parseTableColumns(stmt);
+    if (!parsed) continue;
+    const have = existingColumns(db, parsed.table);
+    for (const col of parsed.columns) {
+      if (have.has(col.name)) continue;
+      let ddl = `ALTER TABLE "${parsed.table}" ADD COLUMN "${col.name}" ${col.type}`;
+      if (col.defaultSql != null) {
+        ddl += ` DEFAULT ${col.defaultSql}`;
+        // NOT NULL is only legal on ADD COLUMN when a DEFAULT supplies a value for the
+        // existing rows; without one SQLite rejects it outright on a non-empty table.
+        if (col.notNull) ddl += ' NOT NULL';
+      }
+      db.execSync(ddl);
+    }
+  }
+  // 3. Indexes last — every referenced column now exists.
+  for (const stmt of NORMALIZED_DDL) {
+    if (isCreateIndex(stmt)) db.execSync(stmt);
+  }
+}
+
 /**
  * Ensure the normalized schema exists and matches src/db/schema.ts, preserving data.
  * One transaction so it's all-or-nothing. FK targets are resolved at write time, not
  * CREATE time, so statement order within the DDL is irrelevant.
+ *
+ * Unconditional: `resetNormalizedSchema` drops the model tables and needs them back
+ * whatever the stored fingerprint says. Boot uses
+ * {@link ensureNormalizedSchemaIfChanged} instead.
  */
 export function ensureNormalizedSchema(db: InternalDb): void {
+  db.withTransactionSync(() => { applyNormalizedDdl(db); });
+}
+
+/**
+ * djb2 over the DDL, folded to a positive 31-bit int for `PRAGMA user_version`
+ * (a signed 32-bit field). Computed from NORMALIZED_DDL itself rather than
+ * generated alongside it, so it cannot drift from what it fingerprints.
+ */
+function ddlFingerprint(): number {
+  const src = NORMALIZED_DDL.join('\n');
+  let h = 5381;
+  for (let i = 0; i < src.length; i += 1) {
+    h = ((h << 5) + h + src.charCodeAt(i)) | 0;
+  }
+  return h & 0x7fffffff;
+}
+
+/** Cached: the DDL is a module constant, so the hash is the same all session. */
+let cachedFingerprint: number | null = null;
+
+/** Whether the DB's stored schema fingerprint differs from the current DDL. */
+export function normalizedSchemaNeedsUpdate(db: InternalDb): boolean {
+  if (cachedFingerprint === null) cachedFingerprint = ddlFingerprint();
+  try {
+    const row = db.getFirstSync<{ user_version: number }>('PRAGMA user_version');
+    return (row?.user_version ?? 0) !== cachedFingerprint;
+  } catch {
+    return true; // can't read the stamp — apply the DDL, it's idempotent
+  }
+}
+
+/**
+ * Boot path: apply the DDL only when it has actually changed, then stamp the DB.
+ *
+ * On a settled install the full pass is ~211 synchronous SQLite round trips (86
+ * CREATE TABLE, 86 PRAGMA table_info, 39 CREATE INDEX) plus a regex parse of every
+ * CREATE TABLE — all of it no-ops, all of it on the JS thread before React starts.
+ * The fingerprint reduces that to one PRAGMA read.
+ *
+ * Schema and stamp share one transaction: a half-applied schema must never be
+ * recorded as current.
+ */
+export function ensureNormalizedSchemaIfChanged(db: InternalDb): boolean {
+  if (!normalizedSchemaNeedsUpdate(db)) return false;
   db.withTransactionSync(() => {
-    // 1. Create any missing tables (fresh install → full schema; existing → no-op).
-    for (const stmt of NORMALIZED_DDL) {
-      if (isCreateTable(stmt)) db.execSync(stmt);
-    }
-    // 2. Add any column schema.ts declares that a pre-existing table lacks — the
-    //    non-destructive path that lets a new column land on populated tables.
-    for (const stmt of NORMALIZED_DDL) {
-      if (!isCreateTable(stmt)) continue;
-      const parsed = parseTableColumns(stmt);
-      if (!parsed) continue;
-      const have = existingColumns(db, parsed.table);
-      for (const col of parsed.columns) {
-        if (have.has(col.name)) continue;
-        let ddl = `ALTER TABLE "${parsed.table}" ADD COLUMN "${col.name}" ${col.type}`;
-        if (col.defaultSql != null) {
-          ddl += ` DEFAULT ${col.defaultSql}`;
-          // NOT NULL is only legal on ADD COLUMN when a DEFAULT supplies a value for the
-          // existing rows; without one SQLite rejects it outright on a non-empty table.
-          if (col.notNull) ddl += ' NOT NULL';
-        }
-        db.execSync(ddl);
-      }
-    }
-    // 3. Indexes last — every referenced column now exists.
-    for (const stmt of NORMALIZED_DDL) {
-      if (isCreateIndex(stmt)) db.execSync(stmt);
-    }
+    applyNormalizedDdl(db);
+    // PRAGMA takes no bind parameters; the value is a locally computed integer.
+    db.execSync(`PRAGMA user_version = ${cachedFingerprint}`);
   });
+  return true;
 }
 
 /**

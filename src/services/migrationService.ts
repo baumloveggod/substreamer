@@ -2326,6 +2326,11 @@ export async function runMigrations(
   // re-swept next boot. Best-effort — return latest even if a cleanup throws.
   const freshInstall = completedVersion === 0 && isDbHealthy();
   const pending = getPendingTasks(completedVersion);
+  // Nothing to do — the common case on every launch after the first. Bail before
+  // the log write: a three-header-line `migration-log.txt` rewritten on every cold
+  // start is pure boot-path cost. The fresh-install fast-track still applies, so an
+  // install with no `runOnFreshInstall` tasks is still stamped to latest.
+  if (pending.length === 0) return freshInstall ? LATEST_MIGRATION_ID : completedVersion;
   const lines: string[] = [];
 
   lines.push(`Migration run: ${new Date().toISOString()}`);

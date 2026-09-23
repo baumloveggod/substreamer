@@ -316,13 +316,13 @@ describe('runMigrations', () => {
     expect(newVersion).toBe(999);
   });
 
-  it('writes a log file even when no tasks are pending', async () => {
+  it('writes no log file when no tasks are pending', async () => {
+    // The common case on every launch after the first. A three-header-line log
+    // rewritten on every cold start is pure boot-path cost.
     await runMigrations(999);
-    expect(mockFileWrite).toHaveBeenCalledTimes(1);
-    const logContent = mockFileWrite.mock.calls[0][0] as string;
-    expect(logContent).toContain('Migration run:');
-    expect(logContent).not.toContain('Task 1');
+    expect(mockFileWrite).not.toHaveBeenCalled();
   });
+
 
   it('logs include platform info', async () => {
     await runMigrations(0);

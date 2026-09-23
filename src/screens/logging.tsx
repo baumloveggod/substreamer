@@ -2,7 +2,7 @@ import Ionicons from "@react-native-vector-icons/ionicons/static";
 import { File, Paths } from 'expo-file-system';
 import { shareAsync } from 'expo-sharing';
 import { HeaderHeightContext } from "expo-router/react-navigation";
-import { useCallback, useContext, useEffect, useState } from 'react';
+import { useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import { ActivityIndicator, Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 
@@ -19,6 +19,7 @@ import { librarySyncDiagnosticsStore } from '../store/librarySyncDiagnosticsStor
 import { remoteControlDiagnosticsStore } from '../store/remoteControlDiagnosticsStore';
 import { voiceSearchDiagnosticsStore } from '../store/voiceSearchDiagnosticsStore';
 import { formatBytes } from '../utils/formatters';
+import { getBootTimings } from '../utils/bootTiming';
 
 const LOG_FILE = new File(Paths.document, 'migration-log.txt');
 const DIAG_LOG_FILE = new File(Paths.document, 'audio-diagnostics.log');
@@ -33,6 +34,10 @@ export function LoggingScreen() {
   const headerHeight = useContext(HeaderHeightContext) ?? 0;
   const [content, setContent] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  // Read-only: every boot mark is recorded long before this screen can be opened,
+  // so the list is stable for the lifetime of the session.
+  const bootTimings = useMemo(() => getBootTimings(), []);
 
   const diagEnabled = audioDiagnosticsStore((s) => s.enabled);
   const diagLogSize = audioDiagnosticsStore((s) => s.logFileSize);
@@ -159,6 +164,38 @@ export function LoggingScreen() {
       style={settingsStyles.container}
       contentContainerStyle={[settingsStyles.content, { paddingTop: headerHeight + 16 }]}
     >
+      {/* Startup Timings — in-memory boot marks, no toggle and no log file */}
+      <View style={settingsStyles.section}>
+        <Text style={[settingsStyles.sectionTitle, { color: colors.label }]}>{t('startupTimings')}</Text>
+        <View style={[settingsStyles.card, settingsStyles.cardPadded, { backgroundColor: colors.card }]}>
+          <Text style={[styles.diagHint, { color: colors.textSecondary }]}>
+            {t('startupTimingsHint')}
+          </Text>
+          {bootTimings.length === 0 ? (
+            <View style={[styles.diagRow, styles.diagRowLast]}>
+              <Text style={[styles.diagLabel, { color: colors.textPrimary }]}>{t('none')}</Text>
+            </View>
+          ) : (
+            bootTimings.map((timing, i) => (
+              <View
+                key={timing.name}
+                style={[
+                  styles.diagRow,
+                  i === bootTimings.length - 1
+                    ? styles.diagRowLast
+                    : { borderBottomColor: colors.border },
+                ]}
+              >
+                <Text style={[styles.diagLabel, { color: colors.textPrimary }]}>{timing.name}</Text>
+                <Text style={[styles.diagValue, { color: colors.textSecondary }]}>
+                  {`${timing.sinceStartMs} ms  (+${timing.deltaMs})`}
+                </Text>
+              </View>
+            ))
+          )}
+        </View>
+      </View>
+
       {/* Audio Diagnostics */}
       <View style={settingsStyles.section}>
         <Text style={[settingsStyles.sectionTitle, { color: colors.label }]}>{t('audioDiagnostics')}</Text>

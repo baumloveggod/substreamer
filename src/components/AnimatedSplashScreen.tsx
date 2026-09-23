@@ -23,14 +23,11 @@ import { useTranslation } from 'react-i18next';
 
 import AnimatedWaveformLogo, { type WaveformHandle } from './AnimatedWaveformLogo';
 import {
-  getPendingTasks,
-  runMigrations,
-} from '../services/migrationService';
-import { rehydrateAllStores } from '../store/persistence/rehydrate';
-import { migrationStore } from '../store/migrationStore';
-// Synchronous adapter: the splash reads `completedVersion` before the store
-// has hydrated, so it must be a synchronous SQLite read.
-import { kvStorageSync as kvStorage } from '../store/persistence';
+  ensureBootHydration,
+  hasPendingMigrations,
+  whenFirstPaintReady,
+} from '../services/bootSequence';
+import { markBoot } from '../utils/bootTiming';
 
 /**
  * Max time (ms) before we force-finish, even if an animation or
@@ -39,11 +36,21 @@ import { kvStorageSync as kvStorage } from '../store/persistence';
 const SAFETY_TIMEOUT = 15_000;
 
 /**
- * Minimum time (ms) the splash screen stays visible after the native splash
- * is dismissed. Under normal motion the animation chain already exceeds this,
- * so it only takes effect when reduce-motion skips animations instantly.
+ * Minimum time (ms) the splash stays visible after the native splash is
+ * dismissed. Short on purpose: it only exists so a very fast boot doesn't
+ * flash the splash in and straight back out.
  */
-const MIN_VISIBLE_MS = 2_000;
+const MIN_VISIBLE_MS = 400;
+
+/** Fade-out duration (ms). */
+const FADE_MS = 250;
+
+/**
+ * Cap (ms) on waiting for the boot chain. The splash covers the app, so a slow
+ * hydration must not hold the UI hostage — past this we fade out and let the
+ * stores populate reactively behind the user.
+ */
+const READY_CAP_MS = 2_500;
 
 /**
  * Scale of native splash logo content vs container. Must match logoScale (0.80)
@@ -85,10 +92,18 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
 
   const onFinishRef = useRef(onFinish);
   const didFinish = useRef(false);
-  const animateCompleted = useRef(false);
-  const waveformCompleted = useRef(false);
+  /** Set once bootsplash's `animate()` has handed over. Nothing may fade before
+   *  then, or the native splash is still the thing on screen. */
+  const handoffDone = useRef(false);
+  /** Set once the boot chain (or the cap) says we may go, so a handoff arriving
+   *  second still triggers the fade. */
+  const readyToFade = useRef(false);
   const visibleSince = useRef(0);
-  const [migrationPhase, setMigrationPhase] = useState<MigrationPhase>('idle');
+  const [migrationPhase, setMigrationPhase] = useState<MigrationPhase>(
+    // Decided synchronously at mount: with migrations pending the status UI is
+    // shown from the start rather than after an animation that is no longer a gate.
+    () => (hasPendingMigrations() ? 'running' : 'idle'),
+  );
   // Imperative handle: the ripple sequence only arms when bootsplash's
   // `animate()` callback fires. Otherwise the forward sweep plays while
   // animatedLogoOpacity is still 0 and the user only sees the reverse sweep.
@@ -98,6 +113,7 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
   const complete = useCallback(() => {
     if (!didFinish.current) {
       didFinish.current = true;
+      markBoot('splashHidden');
       onFinishRef.current();
     }
   }, []);
@@ -105,7 +121,7 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
   const doFadeOut = useCallback(() => {
     containerOpacity.value = withTiming(
       0,
-      { duration: 500, easing: Easing.out(Easing.cubic) },
+      { duration: FADE_MS, easing: Easing.out(Easing.cubic) },
       (finished) => {
         if (finished) runOnJS(complete)();
       },
@@ -113,6 +129,10 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
   }, [containerOpacity, complete]);
 
   const fadeOut = useCallback(() => {
+    readyToFade.current = true;
+    // BootSplash still owns the screen until `animate()` fires. Fading before
+    // that breaks its native → JS handoff; `animate()` calls back in here.
+    if (!handoffDone.current) return;
     const elapsed = Date.now() - visibleSince.current;
     const remaining = MIN_VISIBLE_MS - elapsed;
     if (remaining > 0) {
@@ -137,30 +157,33 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
     dot2Scale.value = withDelay(300, breathe);
   }, [dot0Scale, dot1Scale, dot2Scale]);
 
-  const startMigrations = useCallback(
-    (completedVersion: number) => {
-      runMigrations(completedVersion)
-        .then((finalVersion) => {
-          migrationStore.getState().setCompletedVersion(finalVersion);
-          // Kick off async hydration (SQLite IO on a background thread). It's
-          // fire-and-forget here: stores populate reactively, and the
-          // `_layout` effect independently AWAITS rehydration before
-          // `onStartup()` — that is the authoritative ordering gate against
-          // the "full library resync" banner.
-          void rehydrateAllStores();
-          setMigrationPhase('done');
-        })
-        .catch((e) => {
-          // Defensive: runMigrations catches its own task-level errors
-          // and returns partial progress, so this should never fire.
-          // If it does, still transition to 'done' so the splash does
-          // not hang on the 15s safety timeout.
-          console.warn('[splash] runMigrations rejected unexpectedly', e);
-          setMigrationPhase('done');
-        });
-    },
-    [],
-  );
+  // Drive the boot chain and fade as soon as it says the first frame is real.
+  // The waveform below is decoration now, not the gate: a settled install used to
+  // sit here for ~2.4 s of fixed choreography with nothing left to wait for.
+  const migrationPhaseRef = useRef(migrationPhase);
+  migrationPhaseRef.current = migrationPhase;
+  const fadeOutRef = useRef(fadeOut);
+  fadeOutRef.current = fadeOut;
+  // A ref, not an effect-local flag: the release must survive re-renders. Held in a
+  // local, a re-armed effect would release a second time — and by then the phase has
+  // already moved to 'done', so the second release skips the migration hold.
+  const releasedRef = useRef(false);
+  useEffect(() => {
+    void ensureBootHydration();
+    const release = () => {
+      if (releasedRef.current) return;
+      releasedRef.current = true;
+      // With migrations on screen, hand over to the done-transition effect so the
+      // checkmark and its hold still play. Otherwise fade straight out.
+      if (migrationPhaseRef.current === 'running') setMigrationPhase('done');
+      else fadeOutRef.current();
+    };
+    const capTimer = setTimeout(release, READY_CAP_MS);
+    void whenFirstPaintReady().then(release).catch(release);
+    return () => clearTimeout(capTimer);
+    // Mount-only by design: a one-shot boot driver must never re-arm.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Done transition: dots → checkmark, text cross-fade, then fadeOut
   useEffect(() => {
@@ -200,71 +223,16 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
     return () => clearTimeout(timeout);
   }, [migrationPhase, dot0Scale, dot1Scale, dot2Scale, dotsOpacity, dotsScale, checkOpacity, checkScale, validatingOpacity, completeOpacity, fadeOut]);
 
-  const handleRippleComplete = useCallback(() => {
-    // Read completedVersion directly from SQLite (synchronous) rather than
-    // from the Zustand store, which may not have rehydrated from persistence
-    // yet. Without this, completedVersion reads as 0 and all migrations
-    // appear pending on every launch.
-    let completedVersion = 0;
-    try {
-      const raw = kvStorage.getItem('substreamer-migration') as string | null;
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        completedVersion = parsed?.state?.completedVersion ?? 0;
-      }
-    } catch { /* fall back to 0 — migrations will re-run safely */ }
-    const pending = getPendingTasks(completedVersion);
-
-    if (pending.length === 0) {
-      // No migrations to run, but the per-row stores still need to be
-      // hydrated from SQLite on every launch. Fire async hydration (IO on a
-      // background thread) and fade out; the stores populate reactively and
-      // the `_layout` effect independently awaits hydration before
-      // `onStartup()`.
-      void rehydrateAllStores();
-      fadeOut();
-      return;
-    }
-
-    setMigrationPhase('running');
-
-    // Logo transforms (unchanged)
+  // Migration UI, armed at mount rather than after the ripple: the phase is decided
+  // synchronously by `hasPendingMigrations()`, so there is nothing to wait for.
+  useEffect(() => {
+    if (migrationPhase !== 'running') return;
     logoScale.value = withSpring(0.6);
     logoTranslateY.value = withSpring(-60);
-
-    // Status area fades in, then starts migrations
-    statusOpacity.value = withTiming(
-      1,
-      { duration: 500, easing: Easing.out(Easing.cubic) },
-      (finished) => {
-        if (finished) runOnJS(startMigrations)(completedVersion);
-      },
-    );
-
-    // Start breathing dots
+    statusOpacity.value = withTiming(1, { duration: 500, easing: Easing.out(Easing.cubic) });
     startBreathingDots();
-  }, [fadeOut, logoScale, logoTranslateY, statusOpacity, startMigrations, startBreathingDots]);
-
-  // Two-flag rendezvous: both the BootSplash animate() callback and the
-  // waveform completion must fire before we proceed. Whichever arrives
-  // second triggers handleRippleComplete. This eliminates a race condition
-  // where reduce-motion causes the waveform to finish instantly (before
-  // animate() has been called), losing the completion callback.
-  const tryProceed = useCallback(() => {
-    if (animateCompleted.current && waveformCompleted.current) {
-      handleRippleComplete();
-    }
-  }, [handleRippleComplete]);
-
-  const onAnimateComplete = useCallback(() => {
-    animateCompleted.current = true;
-    tryProceed();
-  }, [tryProceed]);
-
-  const onWaveformComplete = useCallback(() => {
-    waveformCompleted.current = true;
-    tryProceed();
-  }, [tryProceed]);
+    // Fires exactly once: 'running' is only ever left for 'done', which returns early.
+  }, [migrationPhase, logoScale, logoTranslateY, statusOpacity, startBreathingDots]);
 
   const { container, logo } = BootSplash.useHideAnimation({
     manifest: require('../../assets/bootsplash/manifest.json'),
@@ -272,15 +240,17 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
 
     animate: () => {
       visibleSince.current = Date.now();
+      handoffDone.current = true;
+      markBoot('splashHandoff');
       logoImageOpacity.value = 0;
       animatedLogoOpacity.value = 1;
       logoContentScale.value = withTiming(
         1,
         { duration: 300, easing: Easing.out(Easing.cubic) },
-        (finished) => {
-          if (finished) runOnJS(onAnimateComplete)();
-        },
       );
+      // The boot chain can finish before the native splash hands over — on a warm
+      // start it routinely does. `fadeOut` bailed then; run it now.
+      if (readyToFade.current) fadeOut();
       // Mount-time animation start is the wrong trigger here: the bootsplash
       // keeps the waveform invisible until this callback fires, so kick off
       // the ripple sweeps NOW to keep the forward sweep on-screen.
@@ -370,7 +340,6 @@ export default function AnimatedSplashScreen({ onFinish }: Props) {
             ref={waveformRef}
             size={130}
             color="#FFFFFF"
-            onComplete={onWaveformComplete}
             autoStart={false}
           />
         </Animated.View>

@@ -1,3 +1,7 @@
+// First boot marker — the bundle has started evaluating. Import-safe: the module
+// has no imports of its own, so it cannot throw ahead of the registration below.
+require('./src/utils/bootTiming').markBoot('bundleEntry');
+
 // Configure the RNQP player before the app entry so cold-start system wakes
 // (lock screen / CarPlay / assistant) find it ready. Per the RNQP setup guide
 // the engine must be configured from a module, not a React effect.
