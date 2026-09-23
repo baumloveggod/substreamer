@@ -1,6 +1,10 @@
 package expo.modules.ssltrust
 
+import okhttp3.Dns
 import okhttp3.OkHttpClient
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.X509TrustManager
@@ -34,10 +38,21 @@ class CustomOkHttpClientFactory(
             android.util.Log.w("SslTrustStore", "createClientBuilder() reflection failed: ${e.message}")
             OkHttpClient.Builder()
         }
+        // RN's builder sets connectTimeout(0): on networks that resolve AAAA but drop
+        // IPv6 traffic, the first (IPv6) route then hangs until the OS gives up
+        // ("Failed to connect to /<v6 addr>:443") and IPv4 is never tried in time.
+        // Try IPv4 first and bound each connect attempt so OkHttp falls through.
         return builder
+            .dns(Ipv4FirstDns)
+            .connectTimeout(8, TimeUnit.SECONDS)
             .sslSocketFactory(sslSocketFactory, trustManager)
             .hostnameVerifier(CustomHostnameVerifier())
             .build()
+    }
+
+    private object Ipv4FirstDns : Dns {
+        override fun lookup(hostname: String): List<InetAddress> =
+            Dns.SYSTEM.lookup(hostname).sortedBy { if (it is Inet4Address) 0 else 1 }
     }
 
     /**
