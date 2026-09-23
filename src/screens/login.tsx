@@ -272,6 +272,9 @@ export function LoginScreen() {
             }}
             autoCapitalize="none"
             autoCorrect={false}
+            autoComplete="username"
+            textContentType="username"
+            importantForAutofill="yes"
             editable={!loading}
           />
           <TextInput
@@ -284,6 +287,9 @@ export function LoginScreen() {
               setError(null);
             }}
             secureTextEntry
+            autoComplete="password"
+            textContentType="password"
+            importantForAutofill="yes"
             editable={!loading}
             returnKeyType="go"
             onSubmitEditing={handleSubmit}
